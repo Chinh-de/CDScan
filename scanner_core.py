@@ -17,8 +17,18 @@ try:
 except ImportError:
     _ORT_AVAILABLE = False
 
-# ── Model path: same folder as this script ────────────────────────
-_MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "UVDoc_grid.onnx")
+import sys
+
+def resource_path(relative_path):
+    """ Get absolute path to resource, works for dev and for PyInstaller """
+    try:
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
+
+# ── Model path: same folder or bundled path ────────────────────────
+_MODEL_PATH = resource_path("UVDoc_grid.onnx")
 _ort_session = None   # lazy-loaded
 
 
@@ -171,40 +181,24 @@ _MODE_PARAMS = {
 # Public API
 # ──────────────────────────────────────────────
 
-def process_image(
-    path: str,
-    mode: str = "color",
-    force_corners=None,
-) -> tuple:
+def unwarp_image(path: str, force_corners=None) -> tuple:
     """
-    Full pipeline:
-      1. Read at full resolution
-      2. Unwarp:
-         a. UVDoc ONNX model  (if available)
-         b. 4-point perspective transform  (if contour found)
-         c. No warp (full image, just enhance)
-      3. Enhance (color-preserving)
-
-    Returns
-    -------
-    (original_pil, processed_pil, method)
-      method: "onnx" | "perspective" | "enhance_only"
+    Step 1: Read and Flatten (Dewarp).
+    Returns (original_pil, unwarped_bgr, method)
     """
     bgr = cv2.imread(path, cv2.IMREAD_COLOR)
     if bgr is None:
         raise ValueError(f"Cannot read image: {path}")
 
     original_pil = Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
-
-    # ── Unwarp & Crop ────────────────────────────────
     method = "enhance_only"
 
-    # 1. Try ONNX model to flatten the page first (maps back to high-res originally)
+    # 1. Try ONNX model to flatten the page first
     unwarped = _unwarp_with_model(bgr)
     
     if unwarped is not None:
         method = "onnx_cropped"
-        # 2. Find exact crop boundaries on the flattened image (demo.py flow)
+        # 2. Find exact crop boundaries on the flattened image
         if force_corners is not None:
             crop_corners = force_corners
         else:
@@ -212,11 +206,10 @@ def process_image(
             
         # 3. Crop tightly to the detected page boundaries
         if crop_corners is not None:
-            final_image = _four_point_transform(unwarped, crop_corners)
+            final_cv2 = _four_point_transform(unwarped, crop_corners)
         else:
-            final_image = unwarped
+            final_cv2 = unwarped
             method = "onnx_raw"
-            
     else:
         # Fallback: No ONNX model -> pure perspective warp
         if force_corners is not None:
@@ -227,12 +220,20 @@ def process_image(
             if corners is not None:
                 method = "perspective"
 
-        final_image = _four_point_transform(bgr, corners) if corners is not None else bgr
+        final_cv2 = _four_point_transform(bgr, corners) if corners is not None else bgr
 
+    return original_pil, final_cv2, method
+
+
+def enhance_image(final_cv2: np.ndarray, mode: str = "color") -> Image.Image:
+    """
+    Step 2: Apply Filter/Enhancement to a flattened BGR image.
+    Returns processed_pil
+    """
     # ── CLAHE for better contrast before PIL enhancement ──────────
     if mode == "bw_strict":
         # Pure Black & White (Adaptive Threshold)
-        gray = cv2.cvtColor(final_image, cv2.COLOR_BGR2GRAY)
+        gray = cv2.cvtColor(final_cv2, cv2.COLOR_BGR2GRAY)
         denoised = cv2.fastNlMeansDenoising(gray, h=10)
         bw_img = cv2.adaptiveThreshold(
             denoised, 255,
@@ -245,21 +246,28 @@ def process_image(
         # Pre-process based on mode
         if mode in ["super_sharp", "document", "magic_color", "grayscale"]:
             # Light denoising to prevent grain before sharpening
-            final_image = cv2.fastNlMeansDenoisingColored(final_image, None, 3, 3, 7, 21)
+            temp_img = cv2.fastNlMeansDenoisingColored(final_cv2, None, 3, 3, 7, 21)
             # Mild CLAHE (clip=1.2 instead of 2.0)
-            unwarped_bgr = _clahe_bgr(final_image, clip=1.2)
+            enhanced_bgr = _clahe_bgr(temp_img, clip=1.2)
         else:
-            unwarped_bgr = final_image  # 'color' untouched
+            enhanced_bgr = final_cv2  # 'color' untouched
 
-        pil_unwarped = Image.fromarray(cv2.cvtColor(unwarped_bgr, cv2.COLOR_BGR2RGB))
+        pil_img = Image.fromarray(cv2.cvtColor(enhanced_bgr, cv2.COLOR_BGR2RGB))
         
         params = _MODE_PARAMS.get(mode, _MODE_PARAMS["document"])
         if mode == "grayscale":
-            pil_unwarped = pil_unwarped.convert("L").convert("RGB")
+            pil_img = pil_img.convert("L").convert("RGB")
             
-        processed = _enhance_pil(pil_unwarped, *params)
+        processed = _enhance_pil(pil_img, *params)
 
-    return original_pil, processed, method
+    return processed
+
+
+def process_image(path: str, mode: str = "color", force_corners=None) -> tuple:
+    """Full pipeline: unwarp -> enhance (Backward compatibility)"""
+    orig_pil, final_cv2, method = unwarp_image(path, force_corners)
+    processed_pil = enhance_image(final_cv2, mode)
+    return orig_pil, processed_pil, method
 
 
 def model_available() -> bool:

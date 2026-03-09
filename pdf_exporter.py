@@ -58,7 +58,11 @@ def images_to_pdf(
         img_h_pts = img_h_px * 72.0 / dpi
 
         if fit_to_a4:
-            page_w, page_h = A4           # 595.28 x 841.89 pts
+            # Auto-orient: if image is landscape, use landscape A4
+            if img_w_px > img_h_px:
+                page_w, page_h = A4[1], A4[0] # Landscape
+            else:
+                page_w, page_h = A4[0], A4[1] # Portrait
         else:
             page_w, page_h = img_w_pts, img_h_pts
 
@@ -69,7 +73,8 @@ def images_to_pdf(
         avail_h = page_h - 2 * margin
 
         # Scale image to fit available area while preserving aspect ratio
-        scale = min(avail_w / img_w_pts, avail_h / img_h_pts, 1.0)
+        # Removed the 1.0 min cap to allow scaling up small images to fill A4
+        scale = min(avail_w / img_w_pts, avail_h / img_h_pts)
         draw_w = img_w_pts * scale
         draw_h = img_h_pts * scale
 

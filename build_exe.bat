@@ -19,13 +19,17 @@ REM Build with PyInstaller
 pyinstaller ^
     --onefile ^
     --windowed ^
+    --noconsole ^
+    --icon "static/cat_icon.ico" ^
     --name CDscaner ^
-    --add-data "scanner_core.py;." ^
-    --add-data "pdf_exporter.py;." ^
+    --add-data "static;static" ^
+    --add-data "UVDoc_grid.onnx;." ^
+    --add-data "UVDoc_grid.onnx.data;." ^
+    --add-data "credentials.json;." ^
     --hidden-import "PIL._tkinter_finder" ^
-    --hidden-import "tkinterdnd2" ^
-    --hidden-import "reportlab" ^
-    --hidden-import "cv2" ^
+    --collect-all onnxruntime ^
+    --collect-all reportlab ^
+    --collect-all tkinterdnd2 ^
     main_app.py
 
 if errorlevel 1 (
