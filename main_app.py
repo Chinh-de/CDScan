@@ -1347,7 +1347,7 @@ class DocumentScannerApp:
                     except Exception:
                         pass
 
-            self._show_preview(page["unwarped_path"], page["proc_path"])
+            self._show_preview(page["path"], page["proc_path"])
             self._update_action_bar_state()
 
             # Update crop radio buttons silently
@@ -1356,7 +1356,7 @@ class DocumentScannerApp:
             else:
                 self._selected_crop_var.set("ai")
 
-    def _show_preview(self, unwarped_path: str, proc_path: str):
+    def _show_preview(self, orig_path: str, proc_path: str):
         def fit(path, label):
             w = label.winfo_width()  or PREVIEW_MAX
             h = label.winfo_height() or PREVIEW_MAX
@@ -1365,8 +1365,8 @@ class DocumentScannerApp:
             img.thumbnail((w, h), Image.LANCZOS)
             return ImageTk.PhotoImage(img)
 
-        orig_photo = fit(unwarped_path, self._orig_label)
-        proc_photo = fit(proc_path,     self._proc_label)
+        orig_photo = fit(orig_path,  self._orig_label)
+        proc_photo = fit(proc_path,  self._proc_label)
 
         self._orig_label.configure(image=orig_photo, text="")
         self._proc_label.configure(image=proc_photo, text="")
@@ -1470,7 +1470,7 @@ class DocumentScannerApp:
         self._status_var.set(self._t("filter_updated"))
         if 0 <= self._selected_idx < len(self._pages):
             page = self._pages[self._selected_idx]
-            self._show_preview(page["unwarped_path"], page["proc_path"])
+            self._show_preview(page["path"], page["proc_path"])
 
     def _rotate_left_selected(self):
         if not (0 <= self._selected_idx < len(self._pages)) or self._processing:
@@ -1577,7 +1577,7 @@ class DocumentScannerApp:
         self._status_var.set(self._t("ready"))
         if 0 <= self._selected_idx < len(self._pages):
             page = self._pages[self._selected_idx]
-            self._show_preview(page["unwarped_path"], page["proc_path"])
+            self._show_preview(page["path"], page["proc_path"])
             self._update_action_bar_state()
 
     def _export_pdf(self):
