@@ -1,94 +1,76 @@
 """
 pdf_exporter.py
-Converts a list of PIL Images into a single multi-page PDF using ReportLab.
-Each image is placed on its own page with DPI-correct sizing.
+Converts a list of image file paths into a single multi-page PDF using img2pdf.
+Streams directly to disk – no full PDF in RAM.
+Landscape images are automatically rotated left (CCW 90°) to portrait.
 """
 
+import os
+import tempfile
 from pathlib import Path
 from PIL import Image
-from reportlab.lib.pagesizes import A4
-from reportlab.pdfgen import canvas
-from reportlab.lib.utils import ImageReader
-import io
+import img2pdf
 
 
 def images_to_pdf(
-    pil_images: list,
+    paths: list,
     output_path: str,
     fit_to_a4: bool = True,
     dpi: int = 300,
     margin_mm: float = 0.0,
 ) -> str:
     """
-    Write *pil_images* (list of PIL Image objects) to a multi-page PDF.
+    Write images referenced by *paths* to a multi-page PDF.
 
     Parameters
     ----------
-    pil_images   : list of PIL.Image.Image (RGB or L)
+    paths        : list of file-path strings (PNG / JPEG)
     output_path  : destination .pdf path
-    fit_to_a4    : if True, pages use A4 paper size; else natural image size
-    dpi          : nominal DPI used when fitting images
-    margin_mm    : page margin in mm (applied on all sides)
+    fit_to_a4    : scale each page to A4 (210 × 297 mm)
+    dpi, margin_mm : kept for API compatibility (unused by img2pdf path)
 
     Returns
     -------
     str : absolute path of the written PDF
     """
-    if not pil_images:
+    if not paths:
         raise ValueError("No images provided.")
 
     output_path = str(Path(output_path).with_suffix(".pdf"))
 
-    # points-per-mm
-    PTS_PER_MM = 72.0 / 25.4
+    tmp_rotated = []   # temp files created for landscape pages
+    actual_paths = []
 
-    c = canvas.Canvas(output_path)
-
-    for idx, img in enumerate(pil_images):
-        if img.mode not in ("RGB", "L", "RGBA"):
-            img = img.convert("RGB")
-        if img.mode == "RGBA":
-            # ReportLab doesn't support RGBA directly → flatten on white
-            bg = Image.new("RGB", img.size, (255, 255, 255))
-            bg.paste(img, mask=img.split()[3])
-            img = bg
-
-        img_w_px, img_h_px = img.size
-        img_w_pts = img_w_px * 72.0 / dpi
-        img_h_pts = img_h_px * 72.0 / dpi
-
-        if fit_to_a4:
-            # Auto-orient: if image is landscape, use landscape A4
-            if img_w_px > img_h_px:
-                page_w, page_h = A4[1], A4[0] # Landscape
+    try:
+        for p in paths:
+            with Image.open(p) as img:
+                w, h = img.size
+            if w > h:
+                # Landscape → rotate CCW 90°, save to temp
+                with Image.open(p) as img:
+                    rotated = img.rotate(90, expand=True)
+                fd, tmp_path = tempfile.mkstemp(suffix=".png")
+                os.close(fd)
+                rotated.save(tmp_path, "PNG")
+                tmp_rotated.append(tmp_path)
+                actual_paths.append(tmp_path)
             else:
-                page_w, page_h = A4[0], A4[1] # Portrait
-        else:
-            page_w, page_h = img_w_pts, img_h_pts
+                actual_paths.append(str(p))
 
-        c.setPageSize((page_w, page_h))
+        with open(output_path, "wb") as f:
+            if fit_to_a4:
+                a4_layout = img2pdf.get_layout_fun(
+                    (img2pdf.mm_to_pt(210), img2pdf.mm_to_pt(297))
+                )
+                img2pdf.convert(actual_paths, layout_fun=a4_layout, outputstream=f)
+            else:
+                img2pdf.convert(actual_paths, outputstream=f)
 
-        margin = margin_mm * PTS_PER_MM
-        avail_w = page_w - 2 * margin
-        avail_h = page_h - 2 * margin
+    finally:
+        for tmp in tmp_rotated:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
 
-        # Scale image to fit available area while preserving aspect ratio
-        # Removed the 1.0 min cap to allow scaling up small images to fill A4
-        scale = min(avail_w / img_w_pts, avail_h / img_h_pts)
-        draw_w = img_w_pts * scale
-        draw_h = img_h_pts * scale
-
-        # Center on page
-        x = margin + (avail_w - draw_w) / 2
-        y = margin + (avail_h - draw_h) / 2
-
-        # Push image bytes to ReportLab
-        img_byte_arr = io.BytesIO()
-        img.save(img_byte_arr, format="PNG", optimize=False)
-        img_byte_arr.seek(0)
-
-        c.drawImage(ImageReader(img_byte_arr), x, y, draw_w, draw_h)
-        c.showPage()
-
-    c.save()
     return output_path

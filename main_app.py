@@ -8,12 +8,12 @@ import os
 import sys
 import threading
 import tempfile
+import concurrent.futures
 import shutil
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
-from PIL import Image, ImageTk
-import numpy as np
+from PIL import Image, ImageTk, ImageFilter
 import tkinter.simpledialog as simpledialog
 
 # Try to enable drag-and-drop
@@ -26,7 +26,6 @@ except ImportError:
 from scanner_core import unwarp_image, enhance_image, model_available
 from pdf_exporter import images_to_pdf
 from drive_service import DriveService
-import queue
 
 def resource_path(relative_path):
     """ Get absolute path to resource, works for dev and for PyInstaller """
@@ -53,6 +52,21 @@ TEXT_WHITE  = "#ffffff"   # White (on accent buttons)
 
 THUMB_W, THUMB_H = 110, 145
 PREVIEW_MAX = 480
+PAGE_LIST_SIZE = 100   # max thumbnail cards visible per pager page
+
+_JPEG_KW = dict(format="JPEG", quality=72, subsampling=0)   # no chroma downsampling → sharp text
+_JPEG_KW_FULL = dict(format="JPEG", quality=92, subsampling=0)  # high quality fallback
+_SHARP   = ImageFilter.UnsharpMask(radius=1.0, percent=180, threshold=2)
+
+def _save_proc(pil: Image.Image, path: str, reduce_quality: bool = True) -> None:
+    """Save processed/display image: sharpen edges then JPEG."""
+    kw = _JPEG_KW if reduce_quality else _JPEG_KW_FULL
+    pil.filter(_SHARP).save(path, **kw)
+
+def _save_raw(pil: Image.Image, path: str, reduce_quality: bool = True) -> None:
+    """Save intermediate (unwarped) image: JPEG, no sharpening."""
+    kw = _JPEG_KW if reduce_quality else _JPEG_KW_FULL
+    pil.save(path, **kw)
 
 # ───────────────────────────────────────────
 # Translations (VI / EN)
@@ -67,10 +81,6 @@ TRANSLATIONS = {
         "logout":        "Đăng xuất",
         # Mode
         "mode_label":    "Chế độ:",
-        "mode_document": "Tài liệu",
-        "mode_super":    "Siêu nét",
-        "mode_magic":    "Sinh động",
-        "mode_bw":       "Đen trắng",
         "mode_gray":     "Xám",
         "mode_color":    "Tự nhiên",
         "fit_a4":        "Khổ A4",
@@ -88,9 +98,19 @@ TRANSLATIONS = {
         "method_onnx":   "🧠 AI",
         "method_persp":  "✅ Khung",
         "method_orig":   "⚠️ Ảnh gốc",
+        "method_bypass": "🔒 Kh. phẳng",
+        # Image actions
+        "action_rotate_left":  "Xoay trái",
+        "action_rotate_right": "Xoay phải",
+        "crop_none":       "Không cắt",
+        "crop_ai":         "Cắt AI",
+        "default_flatten": "Trải phẳng m.định",
+        "reduce_quality":   "Nén ảnh nhanh",
         # Dialogs
         "select_btn":    "Chọn",
         "cancel_btn":    "Hủy",
+        "cancel_loading":"Hủy xử lý",
+        "canceling":     "Đang dừng...",
         # Confirmations
         "clear_confirm_title": "Xóa tất cả",
         "clear_confirm_msg":   "Xóa toàn bộ danh sách trang?",
@@ -151,10 +171,6 @@ TRANSLATIONS = {
         "logout":        "Log Out",
         # Mode
         "mode_label":    "Mode:",
-        "mode_document": "Document",
-        "mode_super":    "Ultra Sharp",
-        "mode_magic":    "Vivid",
-        "mode_bw":       "B&W",
         "mode_gray":     "Grayscale",
         "mode_color":    "Natural",
         "fit_a4":        "A4 Size",
@@ -172,9 +188,19 @@ TRANSLATIONS = {
         "method_onnx":   "🧠 AI",
         "method_persp":  "✅ Frame",
         "method_orig":   "⚠️ Original",
+        "method_bypass": "🔒 Unflattened",
+        # Image actions
+        "action_rotate_left":  "Rotate Left",
+        "action_rotate_right": "Rotate Right",
+        "crop_none":       "No Crop",
+        "crop_ai":         "AI Crop",
+        "default_flatten": "Flatten by default",
+        "reduce_quality":   "Fast compression",
         # Dialogs
         "select_btn":    "Select",
         "cancel_btn":    "Cancel",
+        "cancel_loading":"Cancel Processing",
+        "canceling":     "Canceling...",
         # Confirmations
         "clear_confirm_title": "Clear All",
         "clear_confirm_msg":   "Delete all pages from the list?",
@@ -291,12 +317,17 @@ class DocumentScannerApp:
         except Exception as e:
             print(f"Warning: Could not set window icon: {e}")
 
-        self._pages: list[dict] = []          # {"path", "orig_pil", "proc_pil", "thumb_photo", "label_widget"}
+        self._pages: list[dict] = []          # {"path", "unwarped_path", "proc_path", "thumb_photo", ...}
         self._selected_idx: int = -1
         self._mode_var    = tk.StringVar(value="color")
         self._status_var  = tk.StringVar(value="Sẵn sàng")  # updated by _apply_lang
-        self._fit_a4_var  = tk.BooleanVar(value=True)
+        self._fit_a4_var  = tk.BooleanVar(value=False)
+        self._flatten_default_var = tk.BooleanVar(value=True)
+        self._reduce_quality_var  = tk.BooleanVar(value=True)
+        self._selected_crop_var = tk.StringVar(value="ai")
         self._processing  = False
+        self._cancel_requested = False
+        self._page_list_page = 0   # current pagination page (0-indexed)
         self._cat_x = 2
         self._cat_dir = 1
         self._animating = False
@@ -311,6 +342,7 @@ class DocumentScannerApp:
         self._setup_styles()
         self._load_icons()
         self._build_ui()
+        self._bind_keys()
         
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -325,6 +357,16 @@ class DocumentScannerApp:
     def _t(self, key):
         """Return translated string for current language."""
         return TRANSLATIONS[self._lang].get(key, TRANSLATIONS["VI"].get(key, key))
+
+    def _bind_keys(self):
+        self.root.bind("<Up>",    lambda e: self._select_page(self._selected_idx - 1) if self._selected_idx > 0 else None)
+        self.root.bind("<Down>",  lambda e: self._select_page(self._selected_idx + 1) if self._selected_idx < len(self._pages) - 1 else None)
+        self.root.bind("<Left>",  lambda e: self._rotate_left_selected())
+        self.root.bind("<Right>", lambda e: self._rotate_right_selected())
+        self.root.bind("<Tab>",   lambda e: self._toggle_crop() or "break")
+        self.root.bind("<BackSpace>", lambda e: self._delete_selected())
+        self.root.bind("<Delete>", lambda e: self._delete_selected())
+
 
     # ── Icons ──────────────────────────────
 
@@ -469,12 +511,8 @@ class DocumentScannerApp:
         mode_frame.pack(side="left", padx=4)
         
         _mode_defs = [
-            ("document",    "📄", "mode_document"),
-            ("super_sharp", "⚡", "mode_super"),
-            ("magic_color", "🪄", "mode_magic"),
-            ("bw_strict",   "🖤", "mode_bw"),
-            ("grayscale",   "🩶", "mode_gray"),
-            ("color",       "🎨", "mode_color"),
+            ("grayscale", "🩶", "mode_gray"),
+            ("color",     "🎨", "mode_color"),
         ]
         self._mode_radios = []
         for val, icon, lbl_key in _mode_defs:
@@ -489,19 +527,42 @@ class DocumentScannerApp:
                                         variable=self._fit_a4_var, style="TCheckbutton")
         self._chk_a4.pack(side="left")
 
+        self._chk_flatten = ttk.Checkbutton(toolbar, text=self._t("default_flatten"),
+                                        variable=self._flatten_default_var, style="TCheckbutton")
+        self._chk_flatten.pack(side="left", padx=10)
+
+        self._chk_reduce_quality = ttk.Checkbutton(toolbar, text=self._t("reduce_quality"),
+                                        variable=self._reduce_quality_var, style="TCheckbutton")
+        self._chk_reduce_quality.pack(side="left")
+
         # ─ Main area
         main = ttk.Frame(self.root)
-        main.pack(fill="both", expand=True)
 
         # Left: page list
         left = ttk.Frame(main, style="Panel.TFrame", width=150)
         left.pack(side="left", fill="y")
         left.pack_propagate(False)
 
-        self._lbl_pagelist = ttk.Label(left, text=self._t("page_list"),
+        header_frame = tk.Frame(left, bg=BG_PANEL)
+        header_frame.pack(fill="x", pady=(10, 4), padx=5)
+
+        self._lbl_pagelist = ttk.Label(header_frame, text=self._t("page_list"),
                   background=BG_PANEL, foreground=TEXT_DIM,
                   font=("Segoe UI", 9, "bold"))
-        self._lbl_pagelist.pack(pady=(10,4))
+        self._lbl_pagelist.pack(anchor="w", pady=(0, 4))
+        
+        sort_frame = tk.Frame(header_frame, bg=BG_PANEL)
+        sort_frame.pack(fill="x")
+
+        self._btn_sort_asc = tk.Button(sort_frame, text="A→Z",
+                                      bg=BG_CARD, fg=TEXT_MAIN, font=("Segoe UI", 7, "bold"),
+                                      command=lambda: self._sort_pages(False), cursor="hand2", relief="flat")
+        self._btn_sort_asc.pack(side="left", padx=(0, 2), expand=True, fill="x")
+        
+        self._btn_sort_desc = tk.Button(sort_frame, text="Z→A",
+                                      bg=BG_CARD, fg=TEXT_MAIN, font=("Segoe UI", 7, "bold"),
+                                      command=lambda: self._sort_pages(True), cursor="hand2", relief="flat")
+        self._btn_sort_desc.pack(side="left", padx=(2, 0), expand=True, fill="x")
 
         list_container = tk.Frame(left, bg=BG_PANEL)
         list_container.pack(fill="both", expand=True)
@@ -522,6 +583,26 @@ class DocumentScannerApp:
         # Bind MouseWheel to scroll the canvas
         self._page_canvas.bind_all("<MouseWheel>", self._on_mousewheel)
 
+        # Pagination controls
+        pager_frame = tk.Frame(left, bg=BG_PANEL)
+        pager_frame.pack(fill="x", padx=4, pady=(2, 4))
+        self._btn_list_prev = tk.Button(
+            pager_frame, text="◀", width=3,
+            bg=BG_CARD, fg=TEXT_MAIN, font=("Segoe UI", 9, "bold"),
+            command=lambda: self._go_to_list_page(-1),
+            cursor="hand2", relief="flat", state=tk.DISABLED)
+        self._btn_list_prev.pack(side="left")
+        self._lbl_list_page = tk.Label(
+            pager_frame, text="", bg=BG_PANEL,
+            fg=TEXT_DIM, font=("Segoe UI", 8))
+        self._lbl_list_page.pack(side="left", expand=True)
+        self._btn_list_next = tk.Button(
+            pager_frame, text="▶", width=3,
+            bg=BG_CARD, fg=TEXT_MAIN, font=("Segoe UI", 9, "bold"),
+            command=lambda: self._go_to_list_page(1),
+            cursor="hand2", relief="flat", state=tk.DISABLED)
+        self._btn_list_next.pack(side="right")
+
         # Center: preview
         center = ttk.Frame(main)
         center.pack(side="left", fill="both", expand=True, padx=8, pady=8)
@@ -539,6 +620,30 @@ class DocumentScannerApp:
                                      text=self._t("no_image"), fg=TEXT_DIM, font=("Segoe UI", 11))
         self._proc_label.grid(row=1, column=1, padx=4, pady=4, sticky="nsew")
 
+        # Context action toolbar
+        action_bar = tk.Frame(center, bg=BG_PANEL, pady=4)
+        action_bar.grid(row=2, column=0, columnspan=2, sticky="ew", padx=4, pady=4)
+
+        self._btn_rotate_left = tk.Button(action_bar, text=self._t("action_rotate_left"),
+                                      bg=BG_CARD, fg=TEXT_MAIN, font=("Segoe UI", 9, "bold"),
+                                      command=self._rotate_left_selected, cursor="hand2", relief="groove")
+        self._btn_rotate_left.pack(side="left", padx=4)
+
+        self._btn_rotate_right = tk.Button(action_bar, text=self._t("action_rotate_right"),
+                                      bg=BG_CARD, fg=TEXT_MAIN, font=("Segoe UI", 9, "bold"),
+                                      command=self._rotate_right_selected, cursor="hand2", relief="groove")
+        self._btn_rotate_right.pack(side="left", padx=4)
+
+        tk.Frame(action_bar, width=1, bg=BG_DARK).pack(side="left", fill="y", padx=10, pady=2)
+        
+        self._crop_none_rb = ttk.Radiobutton(action_bar, text=self._t("crop_none"), variable=self._selected_crop_var, value="none", command=self._on_crop_radio_change, style="TRadiobutton")
+        self._crop_none_rb.pack(side="left", padx=4)
+        
+        self._crop_ai_rb = ttk.Radiobutton(action_bar, text=self._t("crop_ai"), variable=self._selected_crop_var, value="ai", command=self._on_crop_radio_change, style="TRadiobutton")
+        self._crop_ai_rb.pack(side="left", padx=4)
+
+        self._update_action_bar_state()
+
         center.columnconfigure(0, weight=1)
         center.columnconfigure(1, weight=1)
         center.rowconfigure(1, weight=1)
@@ -548,6 +653,9 @@ class DocumentScannerApp:
         status_bar.pack(fill="x", side="bottom")
         status_bar.pack_propagate(False)
 
+        # Pack main area last so it takes the remaining space
+        main.pack(side="top", fill="both", expand=True)
+
         # Cat fly container (The only progress indicator now)
         self._cat_runway = tk.Frame(status_bar, bg=BG_PANEL, width=160, height=35,
                                      highlightthickness=1, highlightbackground=ACCENT)
@@ -556,6 +664,11 @@ class DocumentScannerApp:
         
         self._progress_img = tk.Label(self._cat_runway, image=self._icons.get("progress"), bg=BG_PANEL)
         self._progress_img.place(x=2, y=3)
+
+        self._btn_cancel_status = tk.Button(status_bar, text=self._t("cancel_loading"),
+                                            bg=BG_CARD, fg="#e74c3c", font=("Segoe UI", 9, "bold"),
+                                            command=self._request_cancel, cursor="hand2", relief="groove", state=tk.DISABLED)
+        self._btn_cancel_status.pack(side="right", padx=5)
 
         ttk.Label(status_bar, textvariable=self._status_var, style="Status.TLabel",
                   background=BG_PANEL).pack(side="left", padx=10)
@@ -600,6 +713,18 @@ class DocumentScannerApp:
 
         # A4 checkbox
         self._chk_a4.configure(text=self._t("fit_a4"))
+        self._chk_flatten.configure(text=self._t("default_flatten"))
+        self._chk_reduce_quality.configure(text=self._t("reduce_quality"))
+
+        # Image actions
+        try:
+            self._btn_rotate_left.configure(text=self._t("action_rotate_left"))
+            self._btn_rotate_right.configure(text=self._t("action_rotate_right"))
+            self._crop_none_rb.configure(text=self._t("crop_none"))
+            self._crop_ai_rb.configure(text=self._t("crop_ai"))
+            self._btn_cancel_status.configure(text=self._t("cancel_loading"))
+        except AttributeError:
+            pass
 
         # Sidebar / preview labels
         self._lbl_pagelist.configure(text=self._t("page_list"))
@@ -645,11 +770,11 @@ class DocumentScannerApp:
             self._overlay_win.attributes("-alpha", 0.7) # Slightly higher for text clarity
             self._overlay_win.configure(bg="#ffffff") # High white for frost look
             
-            # Match root's position and size
+            # Match root's position and size except bottom 40px for status bar
             x = self.root.winfo_x()
             y = self.root.winfo_y()
             w = self.root.winfo_width()
-            h = self.root.winfo_height()
+            h = max(10, self.root.winfo_height() - 40)
             self._overlay_win.geometry(f"{w}x{h}+{x}+{y}")
             
             # Add rotating label inside the frosted win
@@ -662,8 +787,22 @@ class DocumentScannerApp:
                                              font=("Segoe UI", 14, "bold"))
             self._overlay_msg_lbl.place(relx=0.5, rely=0.8, anchor="center")
             
+            self._overlay_cancel_btn = tk.Button(self._overlay_win, text=self._t("cancel_loading"),
+                                                 bg=BG_CARD, fg=TEXT_MAIN, font=("Segoe UI", 11, "bold"),
+                                                 command=self._request_cancel, cursor="hand2", relief="groove")
+            self._overlay_cancel_btn.place(relx=0.5, rely=0.9, anchor="center")
+            
+            self._cancel_requested = False
             self._overlay_angle = 0
             self._animate_overlay()
+
+    def _request_cancel(self):
+        self._cancel_requested = True
+        self._update_overlay_msg(self._t("canceling"))
+        if getattr(self, "_overlay_cancel_btn", None):
+            self._overlay_cancel_btn.configure(state=tk.DISABLED)
+        if getattr(self, "_btn_cancel_status", None):
+            self._btn_cancel_status.configure(state=tk.DISABLED)
 
     def _update_overlay_msg(self, msg):
         if self._overlay_active and self._overlay_msg_lbl:
@@ -671,11 +810,14 @@ class DocumentScannerApp:
 
     def _stop_overlay(self):
         self._overlay_active = False
+        if getattr(self, "_btn_cancel_status", None):
+            self._btn_cancel_status.configure(state=tk.DISABLED)
         if self._overlay_win:
             self._overlay_win.destroy()
             self._overlay_win = None
             self._overlay_cat_lbl = None
             self._overlay_msg_lbl = None
+            self._overlay_cancel_btn = None
 
     def _animate_overlay(self):
         if not self._overlay_active:
@@ -692,6 +834,8 @@ class DocumentScannerApp:
         self.root.after(30, self._animate_overlay)
 
     def _start_animation(self):
+        if getattr(self, "_btn_cancel_status", None):
+            self._btn_cancel_status.configure(state=tk.NORMAL)
         if not self._animating:
             self._animating = True
             self._animate_cat()
@@ -801,32 +945,84 @@ class DocumentScannerApp:
                 folder_cache_dir.mkdir(exist_ok=True)
 
                 local_paths = []
-                for i, img in enumerate(images):
+                n_images = len(images)
+
+                # ── Phase 1: Parallel download (4 concurrent downloads) ──
+                def _download_one(args):
+                    idx, img = args
+                    if self._cancel_requested:
+                        return idx, None
                     local_path = folder_cache_dir / img['name']
-                    
                     if local_path.exists():
-                        # Skip download
-                        msg = self._t("drive_cached").format(i=i+1, n=len(images), name=img['name'])
+                        msg = self._t("drive_cached").format(i=idx+1, n=n_images, name=img['name'])
                     else:
-                        msg = self._t("drive_downloading").format(i=i+1, n=len(images), name=img['name'])
-                        ds.download_file(img['id'], local_path)
-                    
+                        msg = self._t("drive_downloading").format(i=idx+1, n=n_images, name=img['name'])
+                        # Each thread gets its own DriveService to avoid shared-state issues
+                        thread_ds = DriveService(credentials_path=resource_path("credentials.json"))
+                        thread_ds.download_file(img['id'], local_path)
                     self.root.after(0, self._status_var.set, msg)
                     self._update_overlay_msg(msg)
-                    local_paths.append(str(local_path))
-                
-                # 2. Load the downloaded images into the UI
+                    return idx, str(local_path)
+
+                dl_results = [None] * n_images
+                with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                    futs = {pool.submit(_download_one, (i, img)): i
+                            for i, img in enumerate(images)}
+                    for fut in concurrent.futures.as_completed(futs):
+                        try:
+                            idx, path = fut.result()
+                            dl_results[idx] = path
+                        except Exception as exc:
+                            print(f"Drive download error: {exc}")
+
+                local_paths = [p for p in dl_results if p]
+
+                # ── Phase 2: Parallel processing ──
                 mode = self._mode_var.get()
-                for i, p in enumerate(local_paths):
-                    msg = self._t("drive_processing").format(i=i+1, n=len(local_paths))
+                bypass = not self._flatten_default_var.get()
+                rq = self._reduce_quality_var.get()
+                n_local = len(local_paths)
+                proc_workers = min(4, max(1, (os.cpu_count() or 2) // 2))
+
+                def _process_one(args):
+                    idx, p = args
+                    if self._cancel_requested:
+                        return idx, None
+                    msg = self._t("drive_processing").format(i=idx+1, n=n_local)
                     self.root.after(0, self._status_var.set, msg)
                     self._update_overlay_msg(msg)
                     try:
-                        orig_pil, proc_cv2, method = unwarp_image(p)
-                        proc_pil = enhance_image(proc_cv2, mode=mode)
-                        self.root.after(0, self._add_page, p, orig_pil, proc_cv2, proc_pil, method)
+                        with Image.open(p) as _img:
+                            _w, _h = _img.size
+                        auto_rot = 270 if _w > _h else 0
+                        unwarped_pil, method = unwarp_image(p, bypass_flatten=bypass, rotation_angle=auto_rot)
+                        proc_pil = enhance_image(unwarped_pil, mode=mode)
+
+                        _, unwarped_path = tempfile.mkstemp(suffix="_u.jpg", dir=self._temp_dir)
+                        _, proc_path     = tempfile.mkstemp(suffix="_p.jpg", dir=self._temp_dir)
+                        _save_raw(unwarped_pil, unwarped_path, rq)
+                        _save_proc(proc_pil, proc_path, rq)
+
+                        thumb = proc_pil.copy()
+                        thumb.thumbnail((THUMB_W, THUMB_H), Image.LANCZOS)
+                        del unwarped_pil, proc_pil
+                        return idx, (p, unwarped_path, proc_path, thumb, method, bypass, auto_rot)
                     except Exception as exc:
                         print(f"Drive image processing error {p}: {exc}")
+                        return idx, None
+
+                # Submit all jobs; iterate futures in submission order so pages
+                # appear in the correct sequence as soon as each is ready
+                with concurrent.futures.ThreadPoolExecutor(max_workers=proc_workers) as pool:
+                    ordered_futs = [pool.submit(_process_one, (i, p))
+                                    for i, p in enumerate(local_paths)]
+                    for fut in ordered_futs:
+                        try:
+                            idx, res = fut.result()
+                            if res:
+                                self.root.after(0, self._add_page, *res)
+                        except Exception as exc:
+                            print(f"Drive processing future error: {exc}")
 
                 self.root.after(0, self._finish_loading)
 
@@ -879,14 +1075,31 @@ class DocumentScannerApp:
 
         def worker():
             mode = self._mode_var.get()
+            bypass = not self._flatten_default_var.get()
             for i, p in enumerate(paths):
+                if self._cancel_requested:
+                    break
+
                 msg = self._t("processing_img").format(i=i+1, n=len(paths), name=Path(p).name)
                 self.root.after(0, self._status_var.set, msg)
                 self._update_overlay_msg(msg)
                 try:
-                    orig_pil, proc_cv2, method = unwarp_image(p)
-                    proc_pil = enhance_image(proc_cv2, mode=mode)
-                    self.root.after(0, self._add_page, p, orig_pil, proc_cv2, proc_pil, method)
+                    with Image.open(p) as _img:
+                        _w, _h = _img.size
+                    auto_rot = 270 if _w > _h else 0
+                    unwarped_pil, method = unwarp_image(p, bypass_flatten=bypass, rotation_angle=auto_rot)
+                    proc_pil = enhance_image(unwarped_pil, mode=mode)
+
+                    _, unwarped_path = tempfile.mkstemp(suffix="_u.jpg", dir=self._temp_dir)
+                    _, proc_path     = tempfile.mkstemp(suffix="_p.jpg", dir=self._temp_dir)
+                    _save_raw(unwarped_pil, unwarped_path, self._reduce_quality_var.get())
+                    _save_proc(proc_pil, proc_path, self._reduce_quality_var.get())
+
+                    thumb = proc_pil.copy()
+                    thumb.thumbnail((THUMB_W, THUMB_H), Image.LANCZOS)
+                    del unwarped_pil, proc_pil
+
+                    self.root.after(0, self._add_page, p, unwarped_path, proc_path, thumb, method, bypass, auto_rot)
                 except Exception as exc:
                     self.root.after(0, lambda e=exc, f=p:
                         messagebox.showerror(self._t("err_process"),
@@ -903,20 +1116,20 @@ class DocumentScannerApp:
         self._status_var.set(self._t("loaded_n").format(n=n))
         self._page_count_var.set(self._t("pages").format(n=n))
 
-    def _add_page(self, path: str, orig: Image.Image, proc_cv2: np.ndarray, proc_pil: Image.Image, method: str = "onnx"):
-        # Build thumbnail
-        thumb = proc_pil.copy()
-        thumb.thumbnail((THUMB_W, THUMB_H), Image.LANCZOS)
-        thumb_photo = ImageTk.PhotoImage(thumb)
+    def _add_page(self, path: str, unwarped_path: str, proc_path: str,
+                  thumb_pil: Image.Image, method: str = "onnx", bypass_flatten: bool = False,
+                  rotation_angle: int = 0):
+        thumb_photo = ImageTk.PhotoImage(thumb_pil)
 
         idx = len(self._pages)
         page_data = {
             "path": path,
-            "orig_pil": orig,
-            "unwarped_cv2": proc_cv2, # Cache the BGR unwarped image
-            "proc_pil": proc_pil,
+            "unwarped_path": unwarped_path,
+            "proc_path": proc_path,
             "thumb_photo": thumb_photo,
             "method": method,
+            "rotation_angle": rotation_angle,
+            "bypass_flatten": bypass_flatten,
         }
         self._pages.append(page_data)
 
@@ -936,11 +1149,13 @@ class DocumentScannerApp:
         num_lbl.pack()
 
         _badge = {
-            "onnx":         (self._t("method_onnx"),  "#27ae60"),
+            "onnx_cropped": (self._t("method_onnx"),  "#27ae60"),
+            "onnx_raw":     (self._t("method_onnx") + " (Raw)", "#27ae60"),
             "perspective":  (self._t("method_persp"), "#2980b9"),
+            "bypass":       (self._t("method_bypass"),"#8e44ad"),
             "enhance_only": (self._t("method_orig"),  "#d35400"),
         }
-        det_text, det_color = _badge.get(method, ("⚠️ Ảnh gốc", "#d35400"))
+        det_text, det_color = _badge.get(method, (self._t("method_orig"), "#d35400"))
         det_lbl = tk.Label(card, text=det_text, bg=BG_CARD, fg=det_color,
                            font=("Segoe UI", 7))
         det_lbl.pack()
@@ -956,42 +1171,73 @@ class DocumentScannerApp:
         self._select_page(idx)
 
     def _refresh_page_widgets(self):
-        """Clears and rebuilds the card list, updates indices and bindings."""
-        # 1. Clear current packings
+        """Rebuilds the card list for the current pagination page only."""
+        total = len(self._pages)
+        total_list_pages = max(1, (total + PAGE_LIST_SIZE - 1) // PAGE_LIST_SIZE)
+        # Clamp current pager page
+        self._page_list_page = max(0, min(self._page_list_page, total_list_pages - 1))
+        start = self._page_list_page * PAGE_LIST_SIZE
+        end   = start + PAGE_LIST_SIZE
+
+        # 1. Hide all cards
         for p in self._pages:
             if "card_widget" in p and p["card_widget"].winfo_exists():
                 p["card_widget"].pack_forget()
-        
-        # 2. Re-pack and update every page
-        for i, page in enumerate(self._pages):
-            idx = i # capture for lambda
+
+        # 2. Re-pack and update only the visible page range
+        for i in range(start, min(end, total)):
+            idx  = i
+            page = self._pages[i]
             card = page.get("card_widget")
             if not card or not card.winfo_exists():
                 continue
-                
+
             card.pack(fill="x", padx=6, pady=3)
-            
+
             # Update labels and re-bind events (NO add="+")
             for child in card.winfo_children():
                 if isinstance(child, tk.Label):
                     # Page Number Label
                     if child.cget("foreground") == ACCENT or child.cget("fg") == ACCENT:
                         child.configure(text=self._t("page_n").format(n=i+1))
-                    
                     # Ensure standard labels select and drag
                     if not isinstance(child, tk.Button):
                         child.bind("<Button-1>", lambda e, x=idx: self._select_page(x))
                         child.bind("<B1-Motion>", lambda e, x=idx: self._on_thumb_drag(e, x))
                         child.bind("<ButtonRelease-1>", lambda e, x=idx: self._on_thumb_release(e, x))
-                
                 elif isinstance(child, tk.Button):
-                    # Delete button
                     child.configure(command=lambda x=idx: self._delete_page(x))
-            
+
             # Re-bind card itself
             card.bind("<Button-1>", lambda e, x=idx: self._select_page(x))
             card.bind("<B1-Motion>", lambda e, x=idx: self._on_thumb_drag(e, x))
             card.bind("<ButtonRelease-1>", lambda e, x=idx: self._on_thumb_release(e, x))
+
+        # 3. Refresh pager nav
+        self._update_list_pager(total_list_pages)
+
+    def _update_list_pager(self, total_list_pages: int):
+        """Refresh pager label and prev/next button states."""
+        if total_list_pages <= 1:
+            self._lbl_list_page.configure(text="")
+            self._btn_list_prev.configure(state=tk.DISABLED)
+            self._btn_list_next.configure(state=tk.DISABLED)
+        else:
+            cur = self._page_list_page + 1
+            self._lbl_list_page.configure(text=f"{cur}/{total_list_pages}")
+            self._btn_list_prev.configure(state=tk.NORMAL if cur > 1 else tk.DISABLED)
+            self._btn_list_next.configure(state=tk.NORMAL if cur < total_list_pages else tk.DISABLED)
+        # Reset canvas scroll to top when pager page changes
+        self._page_canvas.yview_moveto(0)
+
+    def _go_to_list_page(self, delta: int):
+        """Navigate the page list pager by `delta` pages (+1 or -1)."""
+        total = len(self._pages)
+        total_list_pages = max(1, (total + PAGE_LIST_SIZE - 1) // PAGE_LIST_SIZE)
+        new_pg = self._page_list_page + delta
+        if 0 <= new_pg < total_list_pages:
+            self._page_list_page = new_pg
+            self._refresh_page_widgets()
 
     def _on_thumb_drag(self, event, index):
         """Handle visual feedback or state during drag (optional)."""
@@ -1024,9 +1270,21 @@ class DocumentScannerApp:
             self._refresh_page_widgets()
             self._select_page(target_index)
 
+    def _delete_selected(self):
+        if 0 <= self._selected_idx < len(self._pages) and not self._processing:
+            self._delete_page(self._selected_idx)
+
     def _delete_page(self, idx: int):
         if 0 <= idx < len(self._pages):
             page_to_del = self._pages.pop(idx)
+            # Remove temp files
+            for key in ("unwarped_path", "proc_path"):
+                fp = page_to_del.get(key)
+                if fp:
+                    try:
+                        Path(fp).unlink(missing_ok=True)
+                    except Exception:
+                        pass
             card = page_to_del.get("card_widget")
             if card and card.winfo_exists():
                 card.destroy()
@@ -1043,8 +1301,29 @@ class DocumentScannerApp:
                 self._selected_idx = -1
                 self._orig_label.configure(image="", text=self._t("no_image"))
                 self._proc_label.configure(image="", text=self._t("no_image"))
+                self._update_action_bar_state()
+
+    def _update_action_bar_state(self):
+        state = tk.NORMAL if 0 <= self._selected_idx < len(self._pages) else tk.DISABLED
+        try:
+            self._btn_rotate_left.configure(state=state)
+            self._btn_rotate_right.configure(state=state)
+            
+            # Radios handle their own state natively through variable updates, 
+            # but we can disable them too if no image
+            s = "normal" if state == tk.NORMAL else "disabled"
+            self._crop_none_rb.configure(state=s)
+            self._crop_ai_rb.configure(state=s)
+        except AttributeError:
+            pass
 
     def _select_page(self, idx: int):
+        # Auto-navigate to the correct pager page if needed
+        target_list_page = idx // PAGE_LIST_SIZE
+        if target_list_page != self._page_list_page:
+            self._page_list_page = target_list_page
+            self._refresh_page_widgets()
+
         # Deselect previous
         if 0 <= self._selected_idx < len(self._pages):
             prev_card = self._pages[self._selected_idx].get("card_widget")
@@ -1068,18 +1347,26 @@ class DocumentScannerApp:
                     except Exception:
                         pass
 
-            self._show_preview(page["orig_pil"], page["proc_pil"])
+            self._show_preview(page["unwarped_path"], page["proc_path"])
+            self._update_action_bar_state()
 
-    def _show_preview(self, orig: Image.Image, proc: Image.Image):
-        def fit(pil_img: Image.Image, label: tk.Label) -> ImageTk.PhotoImage:
+            # Update crop radio buttons silently
+            if page.get("bypass_flatten", False):
+                self._selected_crop_var.set("none")
+            else:
+                self._selected_crop_var.set("ai")
+
+    def _show_preview(self, unwarped_path: str, proc_path: str):
+        def fit(path, label):
             w = label.winfo_width()  or PREVIEW_MAX
             h = label.winfo_height() or PREVIEW_MAX
-            img = pil_img.copy()
+            with Image.open(path) as img:
+                img = img.copy()
             img.thumbnail((w, h), Image.LANCZOS)
             return ImageTk.PhotoImage(img)
 
-        orig_photo = fit(orig, self._orig_label)
-        proc_photo = fit(proc, self._proc_label)
+        orig_photo = fit(unwarped_path, self._orig_label)
+        proc_photo = fit(proc_path,     self._proc_label)
 
         self._orig_label.configure(image=orig_photo, text="")
         self._proc_label.configure(image=proc_photo, text="")
@@ -1093,6 +1380,13 @@ class DocumentScannerApp:
         if not messagebox.askyesno(self._t("clear_confirm_title"), self._t("clear_confirm_msg")):
             return
         for page in self._pages:
+            for key in ("unwarped_path", "proc_path"):
+                fp = page.get(key)
+                if fp:
+                    try:
+                        Path(fp).unlink(missing_ok=True)
+                    except Exception:
+                        pass
             card = page.get("card_widget")
             if card and card.winfo_exists():
                 card.destroy()
@@ -1102,6 +1396,31 @@ class DocumentScannerApp:
         self._status_var.set(self._t("cleared_all"))
         self._orig_label.configure(image="", text=self._t("no_image"))
         self._proc_label.configure(image="", text=self._t("no_image"))
+        self._update_action_bar_state()
+
+    def _sort_pages(self, reverse=False):
+        if not self._pages:
+            return
+            
+        # Extract selected path before sort to maintain selection
+        sel_path = None
+        if 0 <= self._selected_idx < len(self._pages):
+            sel_path = self._pages[self._selected_idx]["path"]
+            
+        # Sort in-place by filename
+        self._pages.sort(key=lambda p: Path(p["path"]).name.lower(), reverse=reverse)
+        
+        # Determine new selected index
+        new_idx = 0
+        if sel_path:
+            for i, p in enumerate(self._pages):
+                if p["path"] == sel_path:
+                    new_idx = i
+                    break
+                    
+        self._selected_idx = new_idx
+        self._refresh_page_widgets()
+        self._select_page(self._selected_idx)
 
     def _on_mode_change(self):
         """Re-process all loaded images with the new mode."""
@@ -1116,20 +1435,23 @@ class DocumentScannerApp:
 
         def worker():
             for i, page in enumerate(self._pages):
+                if getattr(self, "_cancel_requested", False):
+                    break
+                
                 msg = self._t("updating_i").format(i=i+1, n=len(self._pages), name=Path(page['path']).name)
                 self.root.after(0, self._status_var.set, msg)
                 self._update_overlay_msg(msg)
                 try:
-                    # Optimized: Skip slow unwarping, use cached CV2 image
-                    proc_cv2 = page["unwarped_cv2"]
-                    proc_pil = enhance_image(proc_cv2, mode=mode)
-                    
-                    page["proc_pil"] = proc_pil
-                    # Update thumbnail
+                    # Re-apply filter using saved unwarped image (no full re-warp)
+                    unwarped_pil = Image.open(page["unwarped_path"])
+                    proc_pil = enhance_image(unwarped_pil, mode=mode)
+                    _save_proc(proc_pil, page["proc_path"], self._reduce_quality_var.get())
+
                     thumb = proc_pil.copy()
                     thumb.thumbnail((THUMB_W, THUMB_H), Image.LANCZOS)
                     photo = ImageTk.PhotoImage(thumb)
                     page["thumb_photo"] = photo
+                    del unwarped_pil, proc_pil
                     card = page.get("card_widget")
                     if card and card.winfo_exists():
                         children = card.winfo_children()
@@ -1146,10 +1468,117 @@ class DocumentScannerApp:
         self._processing = False
         self._stop_overlay()
         self._status_var.set(self._t("filter_updated"))
-        # Refresh preview of selected page
         if 0 <= self._selected_idx < len(self._pages):
             page = self._pages[self._selected_idx]
-            self._show_preview(page["orig_pil"], page["proc_pil"])
+            self._show_preview(page["unwarped_path"], page["proc_path"])
+
+    def _rotate_left_selected(self):
+        if not (0 <= self._selected_idx < len(self._pages)) or self._processing:
+            return
+        page = self._pages[self._selected_idx]
+        page["rotation_angle"] = (page.get("rotation_angle", 0) - 90) % 360
+        self._reprocess_page(self._selected_idx)
+
+    def _rotate_right_selected(self):
+        if not (0 <= self._selected_idx < len(self._pages)) or self._processing:
+            return
+        page = self._pages[self._selected_idx]
+        page["rotation_angle"] = (page.get("rotation_angle", 0) + 90) % 360
+        self._reprocess_page(self._selected_idx)
+
+    def _on_crop_radio_change(self):
+        if not (0 <= self._selected_idx < len(self._pages)) or self._processing:
+            return
+        
+        page = self._pages[self._selected_idx]
+        choice = self._selected_crop_var.get()
+        
+        # Avoid unnecessary re-processing
+        old_bypass = page.get("bypass_flatten", False)
+        
+        if choice == "none":
+            page["bypass_flatten"] = True
+            page.pop("force_cv2_crop", None)
+        elif choice == "ai":
+            page["bypass_flatten"] = False
+            page.pop("force_cv2_crop", None)
+            
+        if old_bypass != page.get("bypass_flatten"):
+            self._reprocess_page(self._selected_idx)
+
+    def _toggle_crop(self):
+        if not (0 <= self._selected_idx < len(self._pages)) or self._processing:
+            return
+        cur = self._selected_crop_var.get()
+        self._selected_crop_var.set("ai" if cur == "none" else "none")
+        self._on_crop_radio_change()
+
+    def _reprocess_page(self, idx: int):
+        self._processing = True
+        page = self._pages[idx]
+        mode = self._mode_var.get()
+        
+        status_msg = self._t("updating_i").format(i=idx+1, n=len(self._pages), name=Path(page['path']).name)
+        self._status_var.set(status_msg)
+        self._start_animation()
+
+        def worker():
+            try:
+                from scanner_core import unwarp_image, enhance_image
+                unwarped_pil, method = unwarp_image(
+                    page['path'],
+                    rotation_angle=page.get("rotation_angle", 0),
+                    bypass_flatten=page.get("bypass_flatten", False)
+                )
+                proc_pil = enhance_image(unwarped_pil, mode=mode)
+
+                _save_raw(unwarped_pil, page["unwarped_path"], self._reduce_quality_var.get())
+                _save_proc(proc_pil, page["proc_path"], self._reduce_quality_var.get())
+                page["method"] = method
+
+                thumb = proc_pil.copy()
+                thumb.thumbnail((THUMB_W, THUMB_H), Image.LANCZOS)
+                photo = ImageTk.PhotoImage(thumb)
+                page["thumb_photo"] = photo
+                del unwarped_pil, proc_pil
+
+                card = page.get("card_widget")
+                if card and card.winfo_exists():
+                    self.root.after(0, self._update_card_visuals, card, photo, method)
+                    
+            except Exception as e:
+                print(f"Error reprocessing page {idx}: {e}")
+
+            self.root.after(0, self._after_reprocess_page)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _update_card_visuals(self, card, new_photo, new_method):
+        children = card.winfo_children()
+        # 0: thumb img (Label), 1: name (Label), 2: page num (Label), 3: badge (Label), 4: del (Button)
+        if len(children) >= 4:
+            # Update photo
+            children[0].configure(image=new_photo)
+            children[0]._photo = new_photo
+            
+            # Update badge
+            _badge = {
+                "onnx_cropped": (self._t("method_onnx"),  "#27ae60"),
+                "onnx_raw":     (self._t("method_onnx") + " (Raw)", "#27ae60"),
+                "perspective":  (self._t("method_persp"), "#2980b9"),
+                "bypass":       (self._t("method_bypass"),"#8e44ad"),
+                "enhance_only": (self._t("method_orig"),  "#d35400"),
+            }
+            det_text, det_color = _badge.get(new_method, (self._t("method_orig"), "#d35400"))
+            children[3].configure(text=det_text, fg=det_color)
+
+    def _after_reprocess_page(self):
+        self._processing = False
+        self._status_var.set(self._t("ready"))
+        if 0 <= self._selected_idx < len(self._pages):
+            page = self._pages[self._selected_idx]
+            self._show_preview(page["unwarped_path"], page["proc_path"])
+            self._update_action_bar_state()
 
     def _export_pdf(self):
         if not self._pages:
@@ -1170,12 +1599,12 @@ class DocumentScannerApp:
         self._start_animation()
         self._start_overlay(status_msg)
 
-        pil_images = [p["proc_pil"] for p in self._pages]
+        proc_paths = [p["proc_path"] for p in self._pages]
         fit_a4 = self._fit_a4_var.get()
 
         def worker():
             try:
-                result = images_to_pdf(pil_images, out_path, fit_to_a4=fit_a4)
+                result = images_to_pdf(proc_paths, out_path, fit_to_a4=fit_a4)
                 self.root.after(0, lambda: self._export_done(result))
             except Exception as exc:
                 self.root.after(0, lambda e=exc: (

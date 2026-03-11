@@ -82,8 +82,23 @@ class DriveService:
     def get_images_from_folder_id(self, folder_id):
         """List image files inside a specific folder ID."""
         img_query = f"'{folder_id}' in parents and mimeType contains 'image/' and trashed = false"
-        img_results = self.service.files().list(q=img_query, fields="files(id, name, mimeType)").execute()
-        return img_results.get('files', [])
+        all_files = []
+        page_token = None
+        while True:
+            img_results = self.service.files().list(
+                q=img_query, 
+                fields="nextPageToken, files(id, name, mimeType)", 
+                pageSize=1000,
+                pageToken=page_token
+            ).execute()
+            
+            all_files.extend(img_results.get('files', []))
+            page_token = img_results.get('nextPageToken', None)
+            
+            if page_token is None or len(all_files) >= 10000:
+                break
+                
+        return all_files[:10000]
 
     def list_images_in_folder(self, folder_name):
         """Deprecated: Use find_folders_by_name instead for disambiguation."""
